@@ -1,38 +1,41 @@
-# sv
+# Castnet
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+A net of casts. Build a graph of actors and films, and visualise common actors.
 
-## Creating a project
+## Running
 
-If you're seeing this, you've probably already done this step. Congrats!
+### Neo4j
 
-```sh
-# create a new project in the current directory
-npx sv create
+This is the graph database used to back the back of the backend.
 
-# create a new project in my-app
-npx sv create my-app
+Follow these steps to install local instance of neo4j.
+
+https://neo4j.com/docs/operations-manual/current/installation/linux/tarball/#unix-console
+
+Start neo4j with
+
+```
+sudo -u neo4j /opt/neo4j/bin/neo4j console
 ```
 
-## Developing
+Test you can log in at http://localhost:7474/browser/
 
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
+### Backend
 
-```sh
+```
+cd backend
+```
+
+```
+cargo run
+```
+
+### Frontend
+
+```
+npm install // (I think?)
+```
+
+```
 npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
 ```
-
-## Building
-
-To create a production version of your app:
-
-```sh
-npm run build
-```
-
-You can preview the production build with `npm run preview`.
-
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
