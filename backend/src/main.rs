@@ -3,6 +3,9 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
+use anyhow::{Result, anyhow};
+use thiserror::Error;
+
 use axum::{
     Router,
     extract::{Path, Query, State},
@@ -11,10 +14,9 @@ use axum::{
     routing::{get, post},
 };
 use chrono::Datelike;
-use futures::TryStreamExt;
-use neo4rs::{
-    BoltNull, Config, ConfigBuilder, EndNodeId, Graph, Node, Relation, StartNodeId, query,
-};
+use futures::{TryFutureExt, TryStreamExt};
+use itertools::Itertools;
+use neo4rs::{BoltNull, Config, ConfigBuilder, DeError, EndNodeId, Graph, Node, Relation, StartNodeId, query};
 use reqwest::{Client, Method, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
@@ -67,7 +69,7 @@ impl AppState {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Actor {
     id: u64,
     name: String,
@@ -75,7 +77,7 @@ struct Actor {
     features: u32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Role {
     id: String,
     actor_id: u64,
@@ -83,12 +85,28 @@ struct Role {
     character: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Film {
     id: u64,
     title: String,
+    #[serde(rename = "release_date", deserialize_with = "parse_year_from_date")]
     year: Option<i32>,
     popularity: f64,
+}
+
+fn parse_year_from_date<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let d: Option<String> = Option::deserialize(deserializer)?;
+
+    let year: Option<i32> = d
+        .and_then(|date| chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok())
+        .map(|d| d.year());
+
+    dbg!(&year);
+
+    Ok(year)
 }
 
 async fn create_graph(tokens: &Tokens) -> Graph {
@@ -161,22 +179,11 @@ async fn search_film(
     let mut results = film_list_response.json::<Value>().await.unwrap()["results"]
         .as_array()
         .unwrap_or(&vec![])
-        .iter()
-        .filter_map(|film| {
-            let year = film
-                .get("release_date")?
-                .as_str()
-                .and_then(|date| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
-                .map(|parsed_date| parsed_date.year());
-
-            Some(Film {
-                id: film.get("id")?.as_u64()?,
-                title: film.get("title")?.as_str()?.to_string(),
-                year,
-                popularity: film.get("popularity")?.as_f64()?,
-            })
-        })
+        .into_iter()
+        .filter_map(|film| serde_json::from_value::<Film>(film.clone()).ok())
         .collect::<Vec<_>>();
+
+    dbg!(&results);
 
     // Sort by descending popularity
     results.sort_by(|film_a, film_b| film_b.popularity.total_cmp(&film_a.popularity));
@@ -227,18 +234,8 @@ async fn add_film(Path(film_id): Path<u64>, State(state): State<AppState>) {
         let actor_id = actor.get("id").unwrap().as_i64().unwrap();
         let actor_name = actor.get("name").unwrap().as_str().unwrap().to_string();
         let actor_popularity = actor.get("popularity").unwrap().as_f64().unwrap();
-        let character = actor
-            .get("character")
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_string();
-        let role_id = actor
-            .get("credit_id")
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_string();
+        let character = actor.get("character").unwrap().as_str().unwrap().to_string();
+        let role_id = actor.get("credit_id").unwrap().as_str().unwrap().to_string();
 
         let title = title.clone();
         let year = year.clone();
@@ -299,65 +296,24 @@ struct GraphResponse {
 
 #[axum::debug_handler]
 async fn get_graph(State(state): State<AppState>) -> Json<GraphResponse> {
-    let actors = state
+    let result = state
         .graph
-        .execute(query("MATCH (a:Actor) RETURN a;"))
+        .execute(query(
+            "MATCH (a:Actor)-[r:ROLE]->(f:Film)
+            RETURN collect(DISTINCT a) AS actors,
+                   collect(DISTINCT {id: r.id, actor_id: a.id, film_id: f.id, character: r.character}) AS roles,
+                   collect(DISTINCT f) AS films",
+        ))
         .await
         .unwrap()
-        .into_stream()
-        .map_ok(|row| {
-            let actor: Node = row.get("a").unwrap();
-            Actor {
-                id: actor.get("id").unwrap(),
-                name: actor.get("name").unwrap(),
-                popularity: actor.get("popularity").unwrap(),
-                features: actor.get("features").unwrap(),
-            }
-        })
-        .try_collect::<Vec<Actor>>()
-        .await
-        .unwrap();
-
-    let films = state
-        .graph
-        .execute(query("MATCH (f:Film) RETURN f;"))
+        .next()
         .await
         .unwrap()
-        .into_stream()
-        .map_ok(|row| {
-            let film: Node = row.get("f").unwrap();
-            Film {
-                id: film.get("id").unwrap(),
-                title: film.get("title").unwrap(),
-                year: film.get("year").unwrap(),
-                popularity: film.get("popularity").unwrap(),
-            }
-        })
-        .try_collect::<Vec<Film>>()
-        .await
         .unwrap();
 
-    let roles = state
-        .graph
-        .execute(query("MATCH (a:Actor)-[r:ROLE]->(f:Film) RETURN a, r, f;"))
-        .await
-        .unwrap()
-        .into_stream()
-        .map_ok(|row| {
-            let actor: Node = row.get("a").unwrap();
-            let role: Relation = row.get("r").unwrap();
-            let film: Node = row.get("f").unwrap();
-
-            Role {
-                id: role.get("id").unwrap(),
-                actor_id: actor.get("id").unwrap(),
-                film_id: film.get("id").unwrap(),
-                character: role.get("character").unwrap(),
-            }
-        })
-        .try_collect::<Vec<Role>>()
-        .await
-        .unwrap();
+    let actors = result.get::<Vec<Actor>>("actors").unwrap();
+    let roles = result.get::<Vec<Role>>("roles").unwrap();
+    let films = result.get::<Vec<Film>>("films").unwrap();
 
     println!(
         "Got graph, actors: {}, films: {}, roles: {}",
@@ -366,9 +322,5 @@ async fn get_graph(State(state): State<AppState>) -> Json<GraphResponse> {
         roles.len()
     );
 
-    Json(GraphResponse {
-        actors,
-        films,
-        roles,
-    })
+    Json(GraphResponse { actors, films, roles })
 }

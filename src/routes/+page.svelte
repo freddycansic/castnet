@@ -59,6 +59,7 @@
 	async function instantiateGraph() {
 		cy = cytoscape({
 			container,
+			selectionType: 'attitive',
 			elements: fetchGraphElements(),
 			style: [
 				{
